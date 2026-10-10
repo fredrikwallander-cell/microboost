@@ -1,8 +1,10 @@
 # Microboost
 
-This fork maintains the Windows microphone booster originally created by [Alexey Grigorev](https://github.com/alexeygrigorev/microboost). The original Git history and attribution are retained. The changes below build on upstream commit `d15a99c`.
+**Fork notice:** this is a personal fork of [alexeygrigorev/microboost](https://github.com/alexeygrigorev/microboost) by [Alexey Grigorev](https://github.com/alexeygrigorev), who wrote the original app. All credit for the audio pipeline, UI, and VB-CABLE integration goes to him. This fork adds:
 
 ## Fork changes and bug fixes
+
+The original Git history and attribution are retained. The changes below build on upstream commit `d15a99c`.
 
 ### Fixed
 
