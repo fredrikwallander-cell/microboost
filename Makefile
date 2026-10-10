@@ -1,4 +1,4 @@
-CARGO = /c/Users/Alexey/.cargo/bin/cargo.exe
+CARGO ?= cargo
 TARGET = x86_64-pc-windows-msvc
 RELEASE_BIN = target/$(TARGET)/release/microboost.exe
 

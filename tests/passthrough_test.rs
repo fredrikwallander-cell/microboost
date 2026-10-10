@@ -1,7 +1,7 @@
+use microboost::processing::{AudioMode, AudioProcessor, ProcessingSettings};
 /// Test the actual microboost pipeline: SpscRing + NoiseGate + gain processing.
 /// Feeds a real voice WAV through the same code path as the live audio callbacks.
-
-use microboost::{noise_gate, SpscRing, RING_SIZE};
+use microboost::{noise_gate, Resampler, SpscRing, RING_SIZE};
 
 fn load_wav(path: &str) -> (Vec<f32>, u32) {
     let reader = hound::WavReader::open(path).expect("failed to open WAV");
@@ -29,47 +29,31 @@ fn run_pipeline(
     let ring = SpscRing::new(RING_SIZE);
     let mut output = Vec::new();
     let chunk_size = 480; // 10ms at 48kHz, typical callback size
-    let mut frac: f64 = 0.0;
+    let mut resampler = Resampler::new(48000, (48000.0 / rate_ratio).round() as u32);
+    let mut processor = AudioProcessor::new(48000, gain);
+    let settings = ProcessingSettings {
+        mode: AudioMode::Boost,
+        gain,
+        noise_floor: gate.noise_floor_rms(),
+        gate_enabled: gate.enabled,
+        peak_protection: true,
+    };
 
     for chunk in input.chunks(chunk_size) {
         // === Input callback: gain + gate + push ===
         for &sample in chunk {
-            let boosted = (sample * gain).clamp(-1.0, 1.0);
-            let gated = gate.process(boosted);
-            ring.push(gated);
+            ring.push(processor.process(sample, settings));
         }
 
-        // === Output callback: read with interpolation ===
-        while ring.available() > 1 {
-            let s0 = ring.peek(0);
-            let s1 = ring.peek(1);
-            let t = frac as f32;
-            let interpolated = s0 + (s1 - s0) * t;
-            output.push(interpolated);
-
-            frac += rate_ratio;
-            while frac >= 1.0 {
-                frac -= 1.0;
-                if ring.available() > 0 {
-                    ring.advance(1);
-                }
-            }
+        // Use the very same converter as the application's output callback.
+        while let Some(sample) = resampler.next_sample(&ring) {
+            output.push(sample);
         }
     }
 
     // Drain remaining
-    while ring.available() > 1 {
-        let s0 = ring.peek(0);
-        let s1 = ring.peek(1);
-        let t = frac as f32;
-        output.push(s0 + (s1 - s0) * t);
-        frac += rate_ratio;
-        while frac >= 1.0 {
-            frac -= 1.0;
-            if ring.available() > 0 {
-                ring.advance(1);
-            }
-        }
+    while let Some(sample) = resampler.next_sample(&ring) {
+        output.push(sample);
     }
 
     output
@@ -103,10 +87,7 @@ fn real_voice_1x_passthrough() {
             i, input[i], output[i]
         );
     }
-    eprintln!(
-        "Passed: {} samples, max_diff={}",
-        compare_len, max_diff
-    );
+    eprintln!("Passed: {} samples, max_diff={}", compare_len, max_diff);
 }
 
 #[test]
@@ -127,7 +108,10 @@ fn real_voice_2x_boost() {
         assert!(
             diff < 1e-6,
             "Sample {} differs: expected={}, output={}, diff={}",
-            i, expected, output[i], diff
+            i,
+            expected,
+            output[i],
+            diff
         );
     }
 }
@@ -145,7 +129,9 @@ fn real_voice_050x_attenuate() {
         assert!(
             diff < 1e-6,
             "Sample {} differs: expected={}, output={}",
-            i, expected, output[i]
+            i,
+            expected,
+            output[i]
         );
     }
 }
@@ -167,7 +153,9 @@ fn real_voice_with_noise_gate() {
         assert!(
             output[i].abs() <= input[i].abs() + 1e-6,
             "Sample {} louder than input: in={}, out={}",
-            i, input[i], output[i]
+            i,
+            input[i],
+            output[i]
         );
         if (input[i] - output[i]).abs() > 1e-6 {
             gated_count += 1;

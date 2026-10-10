@@ -22,6 +22,12 @@ pub struct NoiseGate {
     threshold: f32,
     /// Current gate level (0.0 = closed, 1.0 = open)
     gate_level: f32,
+    envelope_sq: f32,
+    hold_samples: u32,
+    detector_coefficient: f32,
+    attack_coefficient: f32,
+    release_coefficient: f32,
+    hold_length: u32,
     /// How much above noise floor to set the threshold (default 1.5x)
     pub headroom: f32,
 }
@@ -39,15 +45,29 @@ impl NoiseGate {
             noise_floor_rms: 0.0,
             threshold: 0.0,
             gate_level: 1.0,
+            envelope_sq: 0.0,
+            hold_samples: 0,
+            detector_coefficient: (-1.0_f32 / (48000.0 * 0.010)).exp(),
+            attack_coefficient: (-1.0_f32 / (48000.0 * 0.005)).exp(),
+            release_coefficient: (-1.0_f32 / (48000.0 * 0.080)).exp(),
+            hold_length: 4800,
             headroom: 1.5,
         }
     }
 
     /// Restore from saved noise floor value
     pub fn restore(&mut self, noise_floor_rms: f32, enabled: bool, headroom: f32) {
-        self.noise_floor_rms = noise_floor_rms;
-        self.headroom = headroom;
-        self.threshold = noise_floor_rms * headroom;
+        self.noise_floor_rms = if noise_floor_rms.is_finite() {
+            noise_floor_rms.max(0.0)
+        } else {
+            0.0
+        };
+        self.headroom = if headroom.is_finite() {
+            headroom.max(1.0)
+        } else {
+            1.5
+        };
+        self.threshold = self.noise_floor_rms * self.headroom;
         self.enabled = enabled;
     }
 
@@ -66,7 +86,7 @@ impl NoiseGate {
         let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
         let rms = (sum_sq / samples.len() as f32).sqrt();
 
-        if rms < 0.00001 {
+        if !rms.is_finite() || rms < 0.00001 {
             return Err("No audio detected — check your microphone");
         }
 
@@ -82,20 +102,29 @@ impl NoiseGate {
     /// Returns the gated sample.
     #[inline]
     pub fn process(&mut self, sample: f32) -> f32 {
+        let sample = if sample.is_finite() { sample } else { 0.0 };
         if !self.enabled || self.threshold == 0.0 {
             return sample;
         }
 
-        let abs = sample.abs();
-
-        // Smoothed gate: fast attack (open quickly), slow release (close gently)
-        if abs > self.threshold {
-            // Attack: open gate quickly
-            self.gate_level = (self.gate_level + 0.1).min(1.0);
-        } else {
-            // Release: close gate slowly to avoid clicks
-            self.gate_level = (self.gate_level - 0.0005).max(0.0);
+        // Compare an RMS envelope to the raw calibrated RMS, not individual
+        // waveform samples. Hold and hysteresis keep quiet syllables intact.
+        let detector = self.detector_coefficient;
+        self.envelope_sq = detector * self.envelope_sq + (1.0 - detector) * sample * sample;
+        let envelope = self.envelope_sq.sqrt();
+        if envelope >= self.threshold {
+            self.hold_samples = self.hold_length;
+        } else if envelope < self.threshold * 0.75 {
+            self.hold_samples = self.hold_samples.saturating_sub(1);
         }
+        let open = envelope >= self.threshold || self.hold_samples > 0;
+        let coefficient = if open {
+            self.attack_coefficient
+        } else {
+            self.release_coefficient
+        };
+        let target = if open { 1.0 } else { 0.0 };
+        self.gate_level = coefficient * self.gate_level + (1.0 - coefficient) * target;
 
         sample * self.gate_level
     }
@@ -129,6 +158,16 @@ impl NoiseGate {
         self.noise_floor_rms = 0.0;
         self.threshold = 0.0;
         self.gate_level = 1.0;
+        self.envelope_sq = 0.0;
+        self.hold_samples = 0;
+    }
+
+    pub fn set_sample_rate(&mut self, sample_rate: u32) {
+        let rate = sample_rate.max(1) as f32;
+        self.detector_coefficient = (-1.0 / (rate * 0.010)).exp();
+        self.attack_coefficient = (-1.0 / (rate * 0.005)).exp();
+        self.release_coefficient = (-1.0 / (rate * 0.080)).exp();
+        self.hold_length = (rate * 0.100) as u32;
     }
 }
 

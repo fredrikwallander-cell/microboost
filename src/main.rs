@@ -1,12 +1,18 @@
 #![windows_subsystem = "windows"]
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use crossbeam_queue::ArrayQueue;
 use eframe::egui;
-use microboost::{noise_gate, SpscRing, RING_SIZE};
+use microboost::{
+    audio, noise_gate,
+    processing::{AudioControls, AudioMode, AudioProcessor},
+    Resampler, SpscRing, RING_SIZE,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+mod desktop;
 
 /// Device profiles — saved per microphone name
 mod profiles {
@@ -53,9 +59,24 @@ mod profiles {
         PathBuf::from(base).join("Microboost").join("settings.json")
     }
 
-    #[derive(Serialize, Deserialize, Default)]
+    #[derive(Serialize, Deserialize, Clone)]
+    #[serde(default)]
     pub struct Settings {
         pub last_input_device: Option<String>,
+        pub startup_mode: microboost::processing::AudioMode,
+        pub close_to_tray: bool,
+        pub peak_protection: bool,
+    }
+
+    impl Default for Settings {
+        fn default() -> Self {
+            Self {
+                last_input_device: None,
+                startup_mode: microboost::processing::AudioMode::Boost,
+                close_to_tray: false,
+                peak_protection: true,
+            }
+        }
     }
 
     pub fn load_settings() -> Settings {
@@ -181,8 +202,7 @@ mod vbcable {
             ));
         }
 
-        *status.lock().unwrap() =
-            "Installing VB-CABLE (admin prompt)...".to_string();
+        *status.lock().unwrap() = "Installing VB-CABLE (admin prompt)...".to_string();
 
         // Run installer elevated (will trigger UAC prompt)
         let install = Command::new("powershell")
@@ -222,7 +242,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([420.0, 740.0])
-            .with_resizable(false)
+            .with_resizable(true)
+            .with_min_inner_size([360.0, 480.0])
             .with_title("Microboost"),
         ..Default::default()
     };
@@ -232,6 +253,271 @@ fn main() -> eframe::Result {
         options,
         Box::new(|_cc| Ok(Box::new(MicroboostApp::new()))),
     )
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    fn mouse_redraws_do_not_change_waveform_speed_or_repaint_deadlines() {
+        let start = std::time::Instant::now();
+        let mut idle = MicroboostApp::new();
+        let mut moving = MicroboostApp::new();
+        for app in [&mut idle, &mut moving] {
+            app.input_history.clear();
+            app.output_history.clear();
+            app.last_visual_sample = start;
+            app.next_visual_repaint = start;
+            app.controls.input_rms.set(0.25);
+            app.controls.output_rms.set(0.5);
+        }
+        // Idle redraws at 30 Hz; mouse events cause 1000 redraws/second.
+        for millis in (0..=990).step_by(33) {
+            let _ = idle.tick_visualizer(start + std::time::Duration::from_millis(millis));
+        }
+        for millis in 0..=990 {
+            let _ = moving.tick_visualizer(start + std::time::Duration::from_millis(millis));
+        }
+        assert_eq!(idle.input_history, vec![0.25; 30]);
+        assert_eq!(idle.output_history, vec![0.5; 30]);
+        assert_eq!(moving.input_history, idle.input_history);
+        assert_eq!(moving.output_history, idle.output_history);
+        assert_eq!(moving.next_visual_repaint, idle.next_visual_repaint);
+        let delay = moving.tick_visualizer(start + std::time::Duration::from_millis(995));
+        assert_eq!(delay, std::time::Duration::from_millis(28));
+    }
+
+    #[test]
+    fn visualizer_catchup_is_bounded_after_a_long_pause() {
+        let mut app = MicroboostApp::new();
+        let start = std::time::Instant::now();
+        app.last_visual_sample = start;
+        app.next_visual_repaint = start;
+        let now = start + std::time::Duration::from_secs(3600);
+        let delay = app.tick_visualizer(now);
+        assert_eq!(app.input_history.len(), 150);
+        assert_eq!(app.output_history.len(), 150);
+        assert!(now.duration_since(app.last_visual_sample) < std::time::Duration::from_millis(33));
+        assert!(delay > std::time::Duration::ZERO && delay <= std::time::Duration::from_millis(33));
+    }
+
+    #[test]
+    fn old_settings_keep_safe_defaults() {
+        let settings: profiles::Settings =
+            serde_json::from_str(r#"{"last_input_device":"My mic"}"#).unwrap();
+        assert_eq!(settings.last_input_device.as_deref(), Some("My mic"));
+        assert_eq!(settings.startup_mode, AudioMode::Boost);
+        assert!(!settings.close_to_tray);
+        assert!(settings.peak_protection);
+        let settings: profiles::Settings = serde_json::from_str(r#"{"peak_protection":false}"#).unwrap();
+        assert!(!settings.peak_protection);
+        for mode in [AudioMode::Boost, AudioMode::Bypass, AudioMode::Mute] {
+            let settings = profiles::Settings {
+                startup_mode: mode,
+                ..Default::default()
+            };
+            let restored: profiles::Settings =
+                serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(restored.startup_mode, mode);
+        }
+    }
+
+    #[test]
+    fn stream_errors_are_visible_and_preserve_mute_for_recovery() {
+        let mut app = MicroboostApp::new();
+        app.setup_state = SetupState::NotInstalled;
+        app.mode = AudioMode::Mute;
+        *app.pipeline_active.lock().unwrap() = true;
+        app.controls.running.store(true, Ordering::Release);
+        app.stream_errors
+            .push("Microphone disconnected".into())
+            .unwrap();
+        app.service_audio();
+        assert_eq!(app.mode, AudioMode::Mute);
+        assert!(!*app.pipeline_active.lock().unwrap());
+        assert!(!app.controls.running.load(Ordering::Acquire));
+        assert_eq!(*app.status.lock().unwrap(), "Microphone disconnected");
+    }
+
+    #[test]
+    fn recording_discards_previous_sessions_and_enforces_its_limit() {
+        let mut app = MicroboostApp::new();
+        app.is_recording = true;
+        app.recording_id = 2;
+        app.sample_rate = 1;
+        *app.rec_samples.lock().unwrap() = Vec::with_capacity(60);
+        app.controls.recording.push((1, -1.0)).unwrap();
+        for _ in 0..100 {
+            app.controls.recording.push((2, 0.25)).unwrap();
+        }
+        app.drain_recording();
+        assert_eq!(*app.rec_samples.lock().unwrap(), vec![0.25; 60]);
+        assert!(app.controls.recording.is_empty());
+    }
+
+    #[test]
+    fn stopping_an_empty_recording_clears_recording_state() {
+        let mut app = MicroboostApp::new();
+        app.is_recording = true;
+        app.controls.recording_id.store(1, Ordering::Release);
+        app.recording_id = 1;
+        app.recording_start = Some(std::time::Instant::now());
+        app.stop_recording();
+        assert!(!app.is_recording);
+        assert_eq!(app.controls.recording_id.load(Ordering::Acquire), 0);
+        assert!(app.recording_start.is_none());
+        assert_eq!(*app.status.lock().unwrap(), "No audio recorded");
+    }
+
+    #[test]
+    fn pipeline_recording_keeps_the_microphones_sample_rate() {
+        let mut app = MicroboostApp::new();
+        *app.pipeline_active.lock().unwrap() = true;
+        app.pipeline_sample_rate = 44100;
+        app.is_active = true;
+        app.start_recording();
+        assert_eq!(app.sample_rate, 44100);
+        assert_ne!(app.controls.recording_id.load(Ordering::Acquire), 0);
+        app.stop_recording();
+    }
+
+    #[test]
+    fn replacing_a_microphone_at_the_same_index_requires_reconnection() {
+        assert_eq!(
+            MicroboostApp::select_input_device(
+                &["replacement mic".to_string()],
+                Some("old mic"),
+                Some("replacement mic")
+            ),
+            (0, true)
+        );
+        assert_eq!(
+            MicroboostApp::select_input_device(
+                &["new mic".to_string(), "old mic".to_string()],
+                Some("old mic"),
+                Some("new mic")
+            ),
+            (1, false)
+        );
+    }
+
+    #[test]
+    fn passthrough_waveforms_are_finite_and_clipped_to_the_graph() {
+        let mut app = MicroboostApp::new();
+        *app.pipeline_active.lock().unwrap() = true;
+        app.is_active = false;
+        app.input_history = vec![0.0, f32::NAN, f32::INFINITY, 0.1];
+        app.output_history = app.input_history.clone();
+        let ctx = egui::Context::default();
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(420.0, 740.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.show_main_screen(ui));
+            },
+        );
+        let mut traces = 0;
+        for shape in &output.shapes {
+            if let egui::Shape::Path(path) = &shape.shape {
+                assert!(
+                    !(path.closed
+                        && path.fill == egui::Color32::from_rgba_premultiplied(40, 180, 40, 25))
+                );
+                if matches!(path.stroke.color, egui::epaint::ColorMode::Solid(color)
+                    if color == egui::Color32::from_rgb(60, 140, 220)
+                        || color == egui::Color32::from_rgb(80, 220, 80))
+                {
+                    traces += 1;
+                    assert!(shape.clip_rect.width() <= 370.0);
+                    assert!(shape.clip_rect.height() <= 60.0);
+                    assert!(path
+                        .points
+                        .iter()
+                        .all(|point| point.is_finite() && shape.clip_rect.contains(*point)));
+                }
+            }
+        }
+        assert_eq!(traces, 2);
+    }
+
+    #[test]
+    fn saved_profiles_render_names_with_multibyte_truncation_boundaries() {
+        let mut app = MicroboostApp::new();
+        // Byte 27 falls inside the accented character in this real device name.
+        let name = format!("{}é microphone", "a".repeat(26));
+        app.input_devices = vec![name.clone()];
+        app.selected_input = 0;
+        app.device_profiles.clear();
+        app.device_profiles.insert(
+            name,
+            profiles::Profile {
+                boost: 100,
+                noise_floor_rms: None,
+                noise_gate_enabled: false,
+            },
+        );
+        let ctx = egui::Context::default();
+        ctx.style_mut(|style| style.animation_time = 0.0);
+        // Exercise the real collapsed-section interaction, then its text rendering.
+        let render = |ctx: &egui::Context, app: &mut MicroboostApp| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.show_main_screen(ui);
+            });
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(420.0, 740.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(input.clone(), |ctx| render(ctx, &mut app));
+        let header_pos = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Saved Profiles" => {
+                    Some(text.pos + egui::vec2(3.0, 3.0))
+                }
+                _ => None,
+            })
+            .expect("Saved Profiles header must be visible");
+        for pressed in [true, false] {
+            let mut click_input = input.clone();
+            click_input.events = vec![
+                egui::Event::PointerMoved(header_pos),
+                egui::Event::PointerButton {
+                    pos: header_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ];
+            let _ = ctx.run(click_input, |ctx| render(ctx, &mut app));
+        }
+        let output = ctx.run(input, |ctx| render(ctx, &mut app));
+        assert!(
+            output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text)
+                if text.galley.text().contains(&format!("{}é...", "a".repeat(26))))
+            }),
+            "the expanded section must actually render the truncated name: {:?}",
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 #[derive(PartialEq)]
@@ -248,9 +534,9 @@ enum CalibrationPhase {
     Listening,
     Done {
         boost_pct: u32,
-        raw_db: f32,      // Your voice level in dBFS
-        boosted_db: f32,   // After boost, in dBFS
-        target_db: f32,    // YouTube target in dBFS
+        raw_db: f32,     // Your voice level in dBFS
+        boosted_db: f32, // After boost, in dBFS
+        target_db: f32,  // YouTube target in dBFS
     },
 }
 
@@ -263,7 +549,6 @@ const CALIBRATION_PHRASES: &[&str] = &[
 /// YouTube recommended voice target: ~-16 dBFS RMS (0.16 linear)
 const TARGET_RMS: f32 = 0.16;
 
-
 struct MicroboostApp {
     host: cpal::Host,
     input_devices: Vec<String>,
@@ -273,6 +558,21 @@ struct MicroboostApp {
 
     boost: u32,
     is_active: bool,
+    mode: AudioMode,
+    settings: profiles::Settings,
+    controls: Arc<AudioControls>,
+    stream_errors: Arc<ArrayQueue<String>>,
+    ui_errors: Arc<ArrayQueue<String>>,
+    playback_stream: Option<cpal::Stream>,
+    playback_finished: Arc<AtomicBool>,
+    last_recovery: std::time::Instant,
+    last_audio_tick: std::time::Instant,
+    tray: Option<desktop::DesktopTray>,
+    tray_initialized: bool,
+    hidden: bool,
+    quitting: bool,
+    start_with_windows: bool,
+    recording_id: u64,
     status: Arc<Mutex<String>>,
 
     // VB-CABLE setup
@@ -284,22 +584,17 @@ struct MicroboostApp {
     output_stream: Arc<Mutex<Option<cpal::Stream>>>,
     ring_buffer: Arc<SpscRing>,
     pipeline_active: Arc<Mutex<bool>>,
-    live_gain: Arc<Mutex<f32>>,       // Shared gain: updated without restarting pipeline
-    live_input_rms: Arc<Mutex<f32>>,  // Raw input level for visualizer
-    live_output_rms: Arc<Mutex<f32>>, // Boosted output level for visualizer
-    input_history: Vec<f32>,   // Rolling waveform history (RMS values)
+    pipeline_sample_rate: u32,
+    input_history: Vec<f32>, // Rolling waveform history (RMS values)
     output_history: Vec<f32>,
-    vis_frame: u32,            // Frame counter for slowing down visualizer
-    vis_accum_in: f32,         // Accumulated input RMS across frames
-    vis_accum_out: f32,        // Accumulated output RMS across frames
+    last_visual_sample: std::time::Instant,
+    next_visual_repaint: std::time::Instant,
 
     // Test recording
     is_recording: bool,
     recording_start: Option<std::time::Instant>,
     last_recording: Option<PathBuf>,
     sample_rate: u32,
-    rec_stream: Arc<Mutex<Option<cpal::Stream>>>,
-    rec_active: Arc<Mutex<bool>>,
     rec_samples: Arc<Mutex<Vec<f32>>>,
 
     // Auto-calibration
@@ -326,11 +621,166 @@ struct MicroboostApp {
 
     // Hot-plug detection
     last_device_check: std::time::Instant,
-
 }
 
-
 impl MicroboostApp {
+    /// Audio history follows wall-clock time, never the number of UI redraws.
+    /// Input events can trigger extra frames anywhere on the desktop.
+    fn tick_visualizer(&mut self, now: std::time::Instant) -> std::time::Duration {
+        // One point per 30 Hz tick gives a roughly five-second graph window.
+        let sample_interval = std::time::Duration::from_millis(33);
+        let elapsed = now.saturating_duration_since(self.last_visual_sample);
+        let steps = elapsed.as_nanos() / sample_interval.as_nanos();
+        if steps > 0 {
+            self.last_visual_sample = now
+                - std::time::Duration::from_nanos(
+                    (elapsed.as_nanos() % sample_interval.as_nanos()) as u64,
+                );
+            // No historical audio is available after a long UI pause. Hold the
+            // latest level, and bound catch-up work to the visible history.
+            let input = self.controls.input_rms.get();
+            let output = self.controls.output_rms.get();
+            for _ in 0..steps.min(150) {
+                self.input_history.push(input);
+                self.output_history.push(output);
+            }
+            for history in [&mut self.input_history, &mut self.output_history] {
+                if history.len() > 150 {
+                    history.drain(..history.len() - 150);
+                }
+            }
+        }
+
+        let frame_interval = std::time::Duration::from_millis(33);
+        if now >= self.next_visual_repaint {
+            let elapsed = now.duration_since(self.next_visual_repaint);
+            self.next_visual_repaint = now + frame_interval
+                - std::time::Duration::from_nanos(
+                    (elapsed.as_nanos() % frame_interval.as_nanos()) as u64,
+                );
+        }
+        self.next_visual_repaint.saturating_duration_since(now)
+    }
+
+    fn handle_desktop(&mut self, ctx: &egui::Context) {
+        if !self.tray_initialized {
+            self.tray_initialized = true;
+            match desktop::DesktopTray::new(ctx.clone()) {
+                Ok(tray) => self.tray = Some(tray),
+                Err(error) => *self.status.lock().unwrap() = format!("Tray unavailable: {error}"),
+            }
+            if self.tray.is_some() && std::env::args().any(|arg| arg == "--tray") {
+                self.hidden = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+        }
+        while let Some(action) = self.tray.as_ref().and_then(|tray| tray.actions.pop()) {
+            match action {
+                desktop::TrayAction::Show => {
+                    self.hidden = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    return;
+                }
+                desktop::TrayAction::Mode(mode) => self.set_mode(mode),
+                desktop::TrayAction::Quit => {
+                    if self.is_recording {
+                        self.stop_recording();
+                    }
+                    self.save_current_profile();
+                    self.kill_pipeline();
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        if let Some(tray) = self.tray.as_mut() {
+            tray.update_mode(self.mode);
+        }
+        let close = ctx.input(|input| input.viewport().close_requested());
+        let minimize = ctx.input(|input| input.viewport().minimized == Some(true));
+        if close && self.settings.close_to_tray && self.tray.is_some() && !self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hidden = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        } else if close {
+            self.quitting = true;
+            if self.is_recording {
+                self.stop_recording();
+            }
+            self.save_current_profile();
+            self.kill_pipeline();
+        } else if minimize && !self.hidden && self.tray.is_some() {
+            self.hidden = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+    }
+
+    fn service_audio(&mut self) {
+        if self.playback_finished.swap(false, Ordering::AcqRel)
+            && self.playback_stream.take().is_some()
+        {
+            *self.status.lock().unwrap() = "Playback finished".into();
+        }
+        while let Some(error) = self.ui_errors.pop() {
+            if self.cal_phase == CalibrationPhase::Listening {
+                self.cancel_calibration();
+            }
+            if self.ng_calibrating {
+                self.cancel_noise_calibration();
+            }
+            *self.status.lock().unwrap() = error;
+        }
+        let resumed = self.last_audio_tick.elapsed() > std::time::Duration::from_secs(5);
+        self.last_audio_tick = std::time::Instant::now();
+        let mut failure = None;
+        while let Some(error) = self.stream_errors.pop() {
+            failure = Some(error);
+        }
+        if resumed
+            || failure.is_some()
+            || (*self.pipeline_active.lock().unwrap()
+                && !self.controls.running.load(Ordering::Acquire))
+        {
+            if self.is_recording {
+                self.stop_recording();
+            }
+            self.kill_pipeline();
+            *self.status.lock().unwrap() =
+                failure.unwrap_or_else(|| "Restoring audio connection…".into());
+        }
+        if self.setup_state == SetupState::Ready
+            && !*self.pipeline_active.lock().unwrap()
+            && self.last_recovery.elapsed() >= std::time::Duration::from_secs(2)
+        {
+            let current = self.input_devices.get(self.selected_input).cloned();
+            self.refresh_devices();
+            let (selected, changed) = Self::select_input_device(
+                &self.input_devices,
+                current.as_deref(),
+                self.host
+                    .default_input_device()
+                    .and_then(|device| device.name().ok())
+                    .as_deref(),
+            );
+            self.selected_input = selected;
+            if changed {
+                self.load_profile_for_device();
+            }
+            self.start_pipeline();
+        }
+        self.drain_recording();
+        if self.is_recording
+            && self
+                .recording_start
+                .map(|time| time.elapsed().as_secs() >= 60)
+                .unwrap_or(false)
+        {
+            self.stop_recording();
+        }
+    }
+
     fn new() -> Self {
         let host = cpal::default_host();
         let (input_devices, output_devices) = Self::enumerate_devices(&host);
@@ -350,9 +800,7 @@ impl MicroboostApp {
                 // Try to match Windows default input device
                 host.default_input_device()
                     .and_then(|d| d.name().ok())
-                    .and_then(|default_name| {
-                        input_devices.iter().position(|d| d == &default_name)
-                    })
+                    .and_then(|default_name| input_devices.iter().position(|d| d == &default_name))
             })
             .unwrap_or(0);
 
@@ -383,6 +831,21 @@ impl MicroboostApp {
             selected_output,
             boost,
             is_active: false,
+            mode: settings.startup_mode,
+            settings,
+            controls: Arc::new(AudioControls::default()),
+            stream_errors: Arc::new(ArrayQueue::new(8)),
+            ui_errors: Arc::new(ArrayQueue::new(8)),
+            playback_stream: None,
+            playback_finished: Arc::new(AtomicBool::new(false)),
+            last_recovery: std::time::Instant::now(),
+            last_audio_tick: std::time::Instant::now(),
+            tray: None,
+            tray_initialized: false,
+            hidden: false,
+            quitting: false,
+            start_with_windows: desktop::starts_with_windows(),
+            recording_id: 0,
             status: Arc::new(Mutex::new("Ready".to_string())),
             setup_state: if cable_installed {
                 SetupState::Ready
@@ -394,20 +857,15 @@ impl MicroboostApp {
             output_stream: Arc::new(Mutex::new(None)),
             ring_buffer: Arc::new(SpscRing::new(RING_SIZE)),
             pipeline_active: Arc::new(Mutex::new(false)),
-            live_gain: Arc::new(Mutex::new(1.0)),
-            live_input_rms: Arc::new(Mutex::new(0.0)),
-            live_output_rms: Arc::new(Mutex::new(0.0)),
+            pipeline_sample_rate: 48000,
             input_history: vec![0.0; 120],
             output_history: vec![0.0; 120],
-            vis_frame: 0,
-            vis_accum_in: 0.0,
-            vis_accum_out: 0.0,
+            last_visual_sample: std::time::Instant::now(),
+            next_visual_repaint: std::time::Instant::now(),
             is_recording: false,
             recording_start: None,
             last_recording: None,
             sample_rate: 48000,
-            rec_stream: Arc::new(Mutex::new(None)),
-            rec_active: Arc::new(Mutex::new(false)),
             rec_samples: Arc::new(Mutex::new(Vec::new())),
 
             cal_phase: CalibrationPhase::Idle,
@@ -453,7 +911,9 @@ impl MicroboostApp {
 
     /// Find an input device by name (avoids index mismatch when CABLE is filtered from UI)
     fn find_input_device_by_name(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
-        host.input_devices().ok()?.find(|d| d.name().ok().as_deref() == Some(name))
+        host.input_devices()
+            .ok()?
+            .find(|d| d.name().ok().as_deref() == Some(name))
     }
 
     fn find_cable_output(devices: &[String]) -> Option<usize> {
@@ -470,6 +930,21 @@ impl MicroboostApp {
         if let Some(idx) = Self::find_cable_output(&self.output_devices) {
             self.selected_output = idx;
         }
+    }
+
+    /// Return the selected index and whether the microphone identity changed.
+    fn select_input_device(
+        devices: &[String],
+        current: Option<&str>,
+        default: Option<&str>,
+    ) -> (usize, bool) {
+        if let Some(pos) = current.and_then(|name| devices.iter().position(|d| d == name)) {
+            return (pos, false);
+        }
+        let index = default
+            .and_then(|name| devices.iter().position(|d| d == name))
+            .unwrap_or(0);
+        (index, true)
     }
 
     /// Periodically check for device changes (hot-plug).
@@ -492,37 +967,25 @@ impl MicroboostApp {
         }
 
         // Get Windows default device name
-        let default_name = self
-            .host
-            .default_input_device()
-            .and_then(|d| d.name().ok());
+        let default_name = self.host.default_input_device().and_then(|d| d.name().ok());
 
-        // If our current device is still present, keep it
-        if let Some(ref name) = current_name {
-            if let Some(pos) = self.input_devices.iter().position(|d| d == name) {
-                self.selected_input = pos;
-                return;
+        let (new_idx, changed) = Self::select_input_device(
+            &self.input_devices,
+            current_name.as_deref(),
+            default_name.as_deref(),
+        );
+        self.selected_input = new_idx;
+        if changed {
+            if self.is_recording {
+                self.stop_recording();
             }
-        }
-
-        // Current device disappeared — switch to default or first available
-        let new_idx = default_name
-            .as_ref()
-            .and_then(|def| self.input_devices.iter().position(|d| d == def))
-            .unwrap_or(0);
-
-        if new_idx != self.selected_input || current_name.is_none() {
             self.selected_input = new_idx;
             self.load_profile_for_device();
 
             // Restart pipeline with new device
-            let was_active = self.is_active;
             self.kill_pipeline();
             if !self.input_devices.is_empty() {
                 self.start_pipeline();
-                if !was_active {
-                    self.stop_pipeline();
-                }
             }
 
             let dev_name = self
@@ -530,8 +993,7 @@ impl MicroboostApp {
                 .get(self.selected_input)
                 .cloned()
                 .unwrap_or("none".to_string());
-            *self.status.lock().unwrap() =
-                format!("Device changed — switched to {}", dev_name);
+            *self.status.lock().unwrap() = format!("Device changed — switched to {}", dev_name);
         }
     }
 
@@ -560,206 +1022,203 @@ impl MicroboostApp {
                         self.setup_state = SetupState::Failed(e);
                     }
                     Err(_) => {
-                        self.setup_state =
-                            SetupState::Failed("Setup thread panicked".to_string());
+                        self.setup_state = SetupState::Failed("Setup thread panicked".to_string());
                     }
                 }
             }
+        }
+    }
+
+    fn sync_audio_controls(&self) {
+        self.controls.gain.set(self.boost as f32 / 100.0);
+        let gate = self.noise_gate.lock().unwrap();
+        self.controls.noise_floor.set(gate.noise_floor_rms());
+        self.controls
+            .gate_enabled
+            .store(gate.enabled, Ordering::Relaxed);
+        self.controls.mode.store(self.mode as u8, Ordering::Release);
+        self.controls
+            .peak_protection
+            .store(self.settings.peak_protection, Ordering::Relaxed);
+    }
+
+    fn set_mode(&mut self, mode: AudioMode) {
+        self.mode = mode;
+        self.is_active = mode == AudioMode::Boost;
+        self.settings.startup_mode = mode;
+        self.sync_audio_controls();
+        profiles::save_settings(&self.settings);
+        if !*self.pipeline_active.lock().unwrap() {
+            self.start_pipeline();
+        } else {
+            *self.status.lock().unwrap() = format!("{} — audio connected", mode.label());
         }
     }
 
     fn start_pipeline(&mut self) {
-        self.save_current_profile();
-
-        // If pipeline is already running, just update gain
+        if self.is_recording && !*self.pipeline_active.lock().unwrap() {
+            self.stop_recording();
+        }
+        self.sync_audio_controls();
         if *self.pipeline_active.lock().unwrap() {
-            *self.live_gain.lock().unwrap() = self.boost as f32 / 100.0;
-            self.is_active = true;
-            let out_name = self
-                .output_devices
-                .get(self.selected_output)
-                .cloned()
-                .unwrap_or_default();
-            *self.status.lock().unwrap() = format!(
-                "Boosting {:.0}x -> {}",
-                self.boost as f32 / 100.0,
-                out_name
-            );
             return;
         }
-
-        let input_device = self
+        self.last_recovery = std::time::Instant::now();
+        // Match both endpoints by name; never fall back to physical speakers.
+        let input = self
             .input_devices
             .get(self.selected_input)
             .and_then(|name| Self::find_input_device_by_name(&self.host, name));
-
-        let output_device = self
-            .host
-            .output_devices()
-            .ok()
-            .and_then(|mut devs| devs.nth(self.selected_output));
-
-        let (input_device, output_device) = match (input_device, output_device) {
-            (Some(i), Some(o)) => (i, o),
-            _ => {
-                *self.status.lock().unwrap() = "Could not open audio devices".to_string();
-                return;
-            }
-        };
-
-        let in_config = match input_device.default_input_config() {
-            Ok(c) => c,
-            Err(e) => {
-                *self.status.lock().unwrap() = format!("Input config error: {}", e);
-                return;
-            }
-        };
-
-        let out_supported = match output_device.default_output_config() {
-            Ok(c) => c,
-            Err(e) => {
-                *self.status.lock().unwrap() = format!("Output config error: {}", e);
-                return;
-            }
-        };
-
-        let in_channels = in_config.channels() as usize;
-        let out_channels = out_supported.channels() as usize;
-        let in_sample_rate = in_config.sample_rate();
-        let out_sample_rate = out_supported.sample_rate();
-
-        let out_config = cpal::StreamConfig {
-            channels: out_supported.channels(),
-            sample_rate: out_sample_rate,
-            buffer_size: cpal::BufferSize::Default,
-        };
-
-        let rate_ratio = in_sample_rate.0 as f64 / out_sample_rate.0 as f64;
-
-        eprintln!(
-            "Pipeline: in={}Hz out={}Hz ratio={:.4} in_ch={} out_ch={}",
-            in_sample_rate.0, out_sample_rate.0, rate_ratio, in_channels, out_channels
-        );
-
-        // Reset ring buffer
-        self.ring_buffer.reset();
-
-        *self.pipeline_active.lock().unwrap() = true;
-
-        let ring = self.ring_buffer.clone();
-        let active = self.pipeline_active.clone();
-        let gain_shared = self.live_gain.clone();
-        let input_rms = self.live_input_rms.clone();
-        let output_rms = self.live_output_rms.clone();
-        let ng = self.noise_gate.clone();
-
-        // Set gain to current boost level
-        *self.live_gain.lock().unwrap() = self.boost as f32 / 100.0;
-
-        let in_stream_config: cpal::StreamConfig = in_config.into();
-        let input_stream = input_device.build_input_stream(
-            &in_stream_config,
-            move |data: &[f32], _| {
-                if !*active.lock().unwrap() {
-                    return;
-                }
-                let gain = *gain_shared.lock().unwrap();
-                let mut gate = ng.lock().unwrap();
-                let mut sum_raw = 0.0f32;
-                let mut sum_out = 0.0f32;
-                let mut count = 0usize;
-                for chunk in data.chunks(in_channels) {
-                    let mono = chunk[0];
-                    let boosted = (mono * gain).clamp(-1.0, 1.0);
-                    // Apply noise gate after boost
-                    let gated = gate.process(boosted);
-                    ring.push(gated);
-                    sum_raw += mono * mono;
-                    sum_out += gated * gated;
-                    count += 1;
-                }
-                if count > 0 {
-                    let raw = (sum_raw / count as f32).sqrt();
-                    let out = (sum_out / count as f32).sqrt();
-                    let mut ir = input_rms.lock().unwrap();
-                    let mut or = output_rms.lock().unwrap();
-                    *ir = *ir * 0.8 + raw * 0.2;
-                    *or = *or * 0.8 + out * 0.2;
-                }
-            },
-            |e| eprintln!("Input error: {}", e),
-            None,
-        );
-
-        let ring2 = self.ring_buffer.clone();
-        let active2 = self.pipeline_active.clone();
-
-        let output_stream = output_device.build_output_stream(
-            &out_config,
-            move |data: &mut [f32], _| {
-                if !*active2.lock().unwrap() {
-                    data.iter_mut().for_each(|s| *s = 0.0);
-                    return;
-                }
-
-                for frame in data.chunks_mut(out_channels) {
-                    let sample = if ring2.available() > 0 {
-                        let s = ring2.peek(0);
-                        ring2.advance(1);
-                        s
-                    } else {
-                        0.0
-                    };
-                    for ch in frame.iter_mut() {
-                        *ch = sample;
+        let output = self
+            .output_devices
+            .get(self.selected_output)
+            .filter(|name| name.to_lowercase().contains("cable input"))
+            .and_then(|name| {
+                self.host
+                    .output_devices()
+                    .ok()?
+                    .find(|device| device.name().ok().as_ref() == Some(name))
+            });
+        let result = (|| -> Result<(cpal::Stream, cpal::Stream, u32), String> {
+            let input = input.ok_or("Microphone unavailable; waiting to reconnect")?;
+            let output = output.ok_or("Virtual cable unavailable; waiting to reconnect")?;
+            let in_config = input
+                .default_input_config()
+                .map_err(|e| format!("Microphone: {e}"))?;
+            let out_config = output
+                .default_output_config()
+                .map_err(|e| format!("Virtual cable: {e}"))?;
+            let input_rate = in_config.sample_rate().0;
+            let input_channels = in_config.channels() as usize;
+            self.ring_buffer = Arc::new(SpscRing::new(RING_SIZE));
+            let ring = self.ring_buffer.clone();
+            let controls = self.controls.clone();
+            let errors = self.stream_errors.clone();
+            let error_controls = self.controls.clone();
+            let mut processor = AudioProcessor::new(input_rate, self.boost as f32 / 100.0);
+            let input_stream = audio::build_input_stream(
+                &input,
+                &in_config,
+                move |data| {
+                    if !controls.running.load(Ordering::Acquire) {
+                        return;
                     }
-                }
-            },
-            |e| eprintln!("Output error: {}", e),
-            None,
-        );
-
-        match (input_stream, output_stream) {
-            (Ok(is), Ok(os)) => {
-                if is.play().is_ok() && os.play().is_ok() {
-                    *self.input_stream.lock().unwrap() = Some(is);
-                    *self.output_stream.lock().unwrap() = Some(os);
-                    self.is_active = true;
-                    let out_name = self
-                        .output_devices
-                        .get(self.selected_output)
-                        .cloned()
-                        .unwrap_or_default();
-                    *self.status.lock().unwrap() = format!(
-                        "Boosting {:.1}x -> {} ({}Hz {}ch -> {}Hz {}ch)",
-                        self.boost as f32 / 100.0,
-                        out_name,
-                        in_sample_rate.0,
-                        in_channels,
-                        out_sample_rate.0,
-                        out_channels,
-                    );
-                } else {
-                    *self.status.lock().unwrap() = "Failed to start audio streams".to_string();
-                }
+                    let settings = controls.settings();
+                    let mut sum_in = 0.0;
+                    let mut sum_out = 0.0;
+                    let mut count = 0;
+                    let mut reduction = 0.0_f32;
+                    for frame in data.chunks(input_channels) {
+                        let raw = frame[0];
+                        let processed = processor.process(raw, settings);
+                        if raw.abs() >= 0.9999 {
+                            controls.clipped.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if !ring.push(processed) {
+                            controls.dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let recording_id = controls.recording_id.load(Ordering::Acquire);
+                        if recording_id != 0
+                            && controls.recording.push((recording_id, processed)).is_err()
+                        {
+                            controls.recording_dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let raw = if raw.is_finite() { raw } else { 0.0 };
+                        sum_in += raw * raw;
+                        sum_out += processed * processed;
+                        reduction = reduction.max(processor.reduction_db);
+                        count += 1;
+                    }
+                    if count > 0 {
+                        controls.input_rms.set(
+                            controls.input_rms.get() * 0.8 + (sum_in / count as f32).sqrt() * 0.2,
+                        );
+                        controls.output_rms.set(
+                            controls.output_rms.get() * 0.8 + (sum_out / count as f32).sqrt() * 0.2,
+                        );
+                        controls.reduction_db.set(reduction);
+                    }
+                },
+                move |error| {
+                    error_controls.running.store(false, Ordering::Release);
+                    let _ = errors.push(format!("Microphone disconnected: {error}"));
+                },
+            )?;
+            let ring = self.ring_buffer.clone();
+            let controls = self.controls.clone();
+            let errors = self.stream_errors.clone();
+            let error_controls = self.controls.clone();
+            let mut resampler = Resampler::new(input_rate, out_config.sample_rate().0);
+            let prebuffer_samples = (input_rate as usize / 50).max(2);
+            let mut prebuffered = false;
+            let output_stream = audio::build_output_stream(
+                &output,
+                &out_config,
+                move || {
+                    if !controls.running.load(Ordering::Acquire) {
+                        return 0.0;
+                    }
+                    if !prebuffered {
+                        if ring.available() < prebuffer_samples {
+                            return 0.0;
+                        }
+                        prebuffered = true;
+                    }
+                    let sample = match resampler.next_sample(&ring) {
+                        Some(sample) => sample,
+                        None => {
+                            controls.underruns.fetch_add(1, Ordering::Relaxed);
+                            prebuffered = false;
+                            0.0
+                        }
+                    };
+                    // Apply mute at playback too so already queued speech is silenced.
+                    if AudioMode::from_byte(controls.mode.load(Ordering::Acquire))
+                        == AudioMode::Mute
+                    {
+                        0.0
+                    } else {
+                        sample
+                    }
+                },
+                move |error| {
+                    error_controls.running.store(false, Ordering::Release);
+                    let _ = errors.push(format!("Virtual cable disconnected: {error}"));
+                },
+            )?;
+            input_stream
+                .play()
+                .map_err(|e| format!("Microphone start failed: {e}"))?;
+            output_stream
+                .play()
+                .map_err(|e| format!("Virtual cable start failed: {e}"))?;
+            Ok((input_stream, output_stream, input_rate))
+        })();
+        match result {
+            Ok((input, output, rate)) => {
+                *self.input_stream.lock().unwrap() = Some(input);
+                *self.output_stream.lock().unwrap() = Some(output);
+                self.pipeline_sample_rate = rate;
+                *self.pipeline_active.lock().unwrap() = true;
+                self.controls.running.store(true, Ordering::Release);
+                self.is_active = self.mode == AudioMode::Boost;
+                *self.status.lock().unwrap() =
+                    format!("{} — connected at {} Hz", self.mode.label(), rate);
             }
-            (Err(e), _) => {
-                *self.status.lock().unwrap() = format!("Input stream error: {}", e);
-            }
-            (_, Err(e)) => {
-                *self.status.lock().unwrap() = format!("Output stream error: {}", e);
+            Err(error) => {
+                self.controls.running.store(false, Ordering::Release);
+                *self.pipeline_active.lock().unwrap() = false;
+                self.is_active = false;
+                *self.status.lock().unwrap() = format!("{error}. Retrying automatically…");
             }
         }
     }
 
-    fn stop_pipeline(&mut self) {
-        // Don't kill the streams — just set gain to 1x passthrough
-        *self.live_gain.lock().unwrap() = 1.0;
-        self.is_active = false;
-        *self.status.lock().unwrap() = "Passthrough (1x)".to_string();
-    }
-
     fn kill_pipeline(&mut self) {
+        self.controls.running.store(false, Ordering::Release);
+        self.controls.input_rms.set(0.0);
+        self.controls.output_rms.set(0.0);
+        self.controls.reduction_db.set(0.0);
         // Actually stop the audio streams (used on device switch)
         *self.pipeline_active.lock().unwrap() = false;
         *self.input_stream.lock().unwrap() = None;
@@ -788,13 +1247,14 @@ impl MicroboostApp {
                 },
             );
             profiles::save(&self.device_profiles);
-            profiles::save_settings(&profiles::Settings {
-                last_input_device: Some(name.clone()),
-            });
+            self.settings.last_input_device = Some(name.clone());
+            profiles::save_settings(&self.settings);
         }
     }
 
     fn load_profile_for_device(&mut self) {
+        self.boost = 200;
+        self.noise_gate.lock().unwrap().reset();
         if let Some(name) = self.input_devices.get(self.selected_input) {
             if let Some(profile) = self.device_profiles.get(name) {
                 self.boost = profile.boost;
@@ -810,19 +1270,9 @@ impl MicroboostApp {
     }
 
     fn update_gain(&mut self) {
-        if self.is_active {
-            // Just update the shared gain — no need to restart pipeline
-            *self.live_gain.lock().unwrap() = self.boost as f32 / 100.0;
-            let out_name = self
-                .output_devices
-                .get(self.selected_output)
-                .cloned()
-                .unwrap_or_default();
-            *self.status.lock().unwrap() = format!(
-                "Boosting {:.0}x -> {}",
-                self.boost as f32 / 100.0,
-                out_name
-            );
+        self.sync_audio_controls();
+        if self.mode == AudioMode::Boost {
+            *self.status.lock().unwrap() = format!("Boost {:.1}×", self.boost as f32 / 100.0);
         }
     }
 
@@ -835,12 +1285,11 @@ impl MicroboostApp {
         self.cal_phase = CalibrationPhase::Listening;
         self.cal_start = Some(std::time::Instant::now());
         // Pick a random phrase
-        self.cal_phrase_idx =
-            (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_millis() as usize)
-                % CALIBRATION_PHRASES.len();
+        self.cal_phrase_idx = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_millis() as usize)
+            % CALIBRATION_PHRASES.len();
 
         let device = self
             .input_devices
@@ -850,36 +1299,44 @@ impl MicroboostApp {
 
         if let Some(device) = device {
             if let Ok(supported_config) = device.default_input_config() {
-                let config: cpal::StreamConfig = supported_config.clone().into();
                 let input_channels = supported_config.channels() as usize;
                 let samples = self.cal_samples.clone();
                 let active = self.cal_active.clone();
                 let rms_live = self.cal_rms_live.clone();
                 let sample_rate = supported_config.sample_rate().0 as usize;
+                *self.cal_samples.lock().unwrap() = Vec::with_capacity(sample_rate * 6);
 
-                if let Ok(stream) = device.build_input_stream(
-                    &config,
-                    move |data: &[f32], _| {
-                        if !*active.lock().unwrap() {
+                let errors = self.ui_errors.clone();
+                if let Ok(stream) = audio::build_input_stream(
+                    &device,
+                    &supported_config,
+                    move |data: &[f32]| {
+                        if !active.try_lock().map(|value| *value).unwrap_or(false) {
                             return;
                         }
-                        let mut s = samples.lock().unwrap();
+                        let Ok(mut s) = samples.try_lock() else {
+                            return;
+                        };
                         for chunk in data.chunks(input_channels) {
                             let mono = chunk[0];
-                            s.push(mono); // Raw, no boost
+                            if s.len() < s.capacity() {
+                                s.push(mono);
+                            } // Raw, no boost
                         }
                         // Update live RMS over last ~0.3s
                         let window = sample_rate / 3;
                         if s.len() > window {
                             let recent = &s[s.len() - window..];
-                            let sum_sq: f32 =
-                                recent.iter().map(|x| x * x).sum();
+                            let sum_sq: f32 = recent.iter().map(|x| x * x).sum();
                             let rms = (sum_sq / recent.len() as f32).sqrt();
-                            *rms_live.lock().unwrap() = rms;
+                            if let Ok(mut live) = rms_live.try_lock() {
+                                *live = rms;
+                            }
                         }
                     },
-                    |e| eprintln!("Calibration error: {}", e),
-                    None,
+                    move |error| {
+                        let _ = errors.push(format!("Calibration audio error: {error}"));
+                    },
                 ) {
                     if stream.play().is_ok() {
                         *self.cal_stream.lock().unwrap() = Some(stream);
@@ -887,7 +1344,12 @@ impl MicroboostApp {
                 }
             }
         }
-        *self.status.lock().unwrap() = "Calibrating — speak now...".to_string();
+        if self.cal_stream.lock().unwrap().is_none() {
+            self.cancel_calibration();
+            *self.status.lock().unwrap() = "Could not open microphone for calibration".into();
+        } else {
+            *self.status.lock().unwrap() = "Calibrating — speak now...".into();
+        }
     }
 
     fn finish_calibration(&mut self) {
@@ -970,24 +1432,32 @@ impl MicroboostApp {
 
         if let Some(device) = device {
             if let Ok(supported_config) = device.default_input_config() {
-                let config: cpal::StreamConfig = supported_config.clone().into();
                 let input_channels = supported_config.channels() as usize;
                 let cal_state = self.ng_cal_state.clone();
+                self.ng_cal_state.lock().unwrap().samples =
+                    Vec::with_capacity(supported_config.sample_rate().0 as usize * 4);
 
-                if let Ok(stream) = device.build_input_stream(
-                    &config,
-                    move |data: &[f32], _| {
-                        let mut cal = cal_state.lock().unwrap();
+                let errors = self.ui_errors.clone();
+                if let Ok(stream) = audio::build_input_stream(
+                    &device,
+                    &supported_config,
+                    move |data: &[f32]| {
+                        let Ok(mut cal) = cal_state.try_lock() else {
+                            return;
+                        };
                         if !cal.active {
                             return;
                         }
                         for chunk in data.chunks(input_channels) {
                             let mono = chunk[0];
-                            cal.samples.push(mono);
+                            if cal.samples.len() < cal.samples.capacity() {
+                                cal.samples.push(mono);
+                            }
                         }
                     },
-                    |e| eprintln!("Noise cal error: {}", e),
-                    None,
+                    move |error| {
+                        let _ = errors.push(format!("Calibration audio error: {error}"));
+                    },
                 ) {
                     if stream.play().is_ok() {
                         *self.ng_cal_stream.lock().unwrap() = Some(stream);
@@ -995,7 +1465,12 @@ impl MicroboostApp {
                 }
             }
         }
-        *self.status.lock().unwrap() = "Noise calibration — stay SILENT...".to_string();
+        if self.ng_cal_stream.lock().unwrap().is_none() {
+            self.cancel_noise_calibration();
+            *self.status.lock().unwrap() = "Could not open microphone for noise calibration".into();
+        } else {
+            *self.status.lock().unwrap() = "Noise calibration — stay SILENT...".into();
+        }
     }
 
     fn finish_noise_calibration(&mut self) {
@@ -1042,81 +1517,48 @@ impl MicroboostApp {
         *self.status.lock().unwrap() = "Noise calibration cancelled".to_string();
     }
 
-    fn start_recording(&mut self) {
-        *self.rec_samples.lock().unwrap() = Vec::new();
-        *self.rec_active.lock().unwrap() = true;
-        self.is_recording = true;
-        self.recording_start = Some(std::time::Instant::now());
-
-        if self.is_active {
-            // Pipeline is running — tap into the ring buffer
-            let ring = self.ring_buffer.clone();
-            let rec_samples = self.rec_samples.clone();
-            let rec_active = self.rec_active.clone();
-            self.sample_rate = 48000; // approximate, will be close enough
-
-            std::thread::spawn(move || {
-                let mut last_w = ring.write.load(Ordering::Acquire);
-                while *rec_active.lock().unwrap() {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    let w = ring.write.load(Ordering::Acquire);
-                    let mut samples = rec_samples.lock().unwrap();
-                    while last_w != w {
-                        samples.push(ring.read_at(last_w));
-                        last_w = (last_w + 1) % (RING_SIZE * 2);
-                    }
-                }
-            });
-
-            *self.status.lock().unwrap() = "Recording from boost pipeline...".to_string();
-        } else {
-            // Pipeline not running — open mic directly
-            let device = self
-                .input_devices
-                .get(self.selected_input)
-                .and_then(|name| Self::find_input_device_by_name(&self.host, name))
-                .or_else(|| self.host.default_input_device());
-
-            if let Some(device) = device {
-                if let Ok(supported_config) = device.default_input_config() {
-                    self.sample_rate = supported_config.sample_rate().0;
-                    let config: cpal::StreamConfig = supported_config.clone().into();
-                    let samples = self.rec_samples.clone();
-                    let active = self.rec_active.clone();
-                    let input_channels = supported_config.channels() as usize;
-                    let gain = self.boost as f32 / 100.0;
-
-                    if let Ok(stream) = device.build_input_stream(
-                        &config,
-                        move |data: &[f32], _| {
-                            if *active.lock().unwrap() {
-                                let mut s = samples.lock().unwrap();
-                                for chunk in data.chunks(input_channels) {
-                                    let mono =
-                                        chunk[0];
-                                    s.push((mono * gain).clamp(-1.0, 1.0));
-                                }
-                            }
-                        },
-                        |e| eprintln!("Audio error: {}", e),
-                        None,
-                    ) {
-                        if stream.play().is_ok() {
-                            *self.rec_stream.lock().unwrap() = Some(stream);
-                        }
-                    }
-                }
+    fn drain_recording(&mut self) {
+        let limit = self.sample_rate as usize * 60;
+        let mut samples = self.rec_samples.lock().unwrap();
+        while let Some((id, sample)) = self.controls.recording.pop() {
+            if self.is_recording && id == self.recording_id && samples.len() < limit {
+                samples.push(sample);
             }
-            *self.status.lock().unwrap() = "Recording test (with boost)...".to_string();
         }
     }
 
+    fn start_recording(&mut self) {
+        self.playback_stream = None;
+        if !*self.pipeline_active.lock().unwrap() {
+            self.start_pipeline();
+        }
+        if !*self.pipeline_active.lock().unwrap() {
+            return;
+        }
+        self.sample_rate = self.pipeline_sample_rate;
+        // Reserve a full minute on the UI thread; callbacks only push into the
+        // preallocated bounded queue. A session id prevents stale recordings.
+        *self.rec_samples.lock().unwrap() = Vec::with_capacity(self.sample_rate as usize * 60);
+        while self.controls.recording.pop().is_some() {}
+        self.recording_id = self.recording_id.wrapping_add(1).max(1);
+        self.controls.recording_dropped.store(0, Ordering::Relaxed);
+        self.is_recording = true;
+        self.recording_start = Some(std::time::Instant::now());
+        self.controls
+            .recording_id
+            .store(self.recording_id, Ordering::Release);
+        *self.status.lock().unwrap() =
+            format!("Recording {} output (60 second limit)…", self.mode.label());
+    }
+
     fn stop_recording(&mut self) {
-        *self.rec_active.lock().unwrap() = false;
-        *self.rec_stream.lock().unwrap() = None;
+        self.controls.recording_id.store(0, Ordering::Release);
+        self.drain_recording();
+        self.is_recording = false;
 
         let samples = self.rec_samples.lock().unwrap().clone();
         if samples.is_empty() {
+            self.recording_start = None;
             *self.status.lock().unwrap() = "No audio recorded".to_string();
             return;
         }
@@ -1150,118 +1592,68 @@ impl MicroboostApp {
             *self.status.lock().unwrap() = format!("Saved: {}s", elapsed);
         }
 
-        self.is_recording = false;
         self.recording_start = None;
     }
 
     fn play_recording(&mut self) {
-        if let Some(ref path) = self.last_recording {
-            let path = path.clone();
-            let status = self.status.clone();
-            let samples = self.rec_samples.clone();
-            let sample_rate = self.sample_rate;
-            *status.lock().unwrap() = "Playing...".to_string();
-
-            let host = cpal::default_host();
-            let speaker = host.default_output_device();
-
-            let speaker = match speaker {
-                Some(s) => s,
-                None => {
-                    *status.lock().unwrap() = "No speaker found".to_string();
-                    return;
-                }
-            };
-
-            let out_config = match speaker.default_output_config() {
-                Ok(c) => c,
-                Err(e) => {
-                    *status.lock().unwrap() = format!("Speaker error: {}", e);
-                    return;
-                }
-            };
-
-            let out_channels = out_config.channels() as usize;
-            let out_rate = out_config.sample_rate().0;
-            let config: cpal::StreamConfig = out_config.into();
-
-            let samples_data = samples.lock().unwrap().clone();
-            if samples_data.is_empty() {
-                // Try loading from file
-                if let Ok(mut reader) = hound::WavReader::open(&path) {
-                    let loaded: Vec<f32> = reader
-                        .samples::<i16>()
-                        .filter_map(|s| s.ok())
-                        .map(|s| s as f32 / i16::MAX as f32)
-                        .collect();
-                    if loaded.is_empty() {
-                        *status.lock().unwrap() = "Empty recording".to_string();
-                        return;
-                    }
-                    *samples.lock().unwrap() = loaded;
-                } else {
-                    *status.lock().unwrap() = "Could not read file".to_string();
-                    return;
-                }
+        self.playback_stream = None;
+        let Some(path) = self.last_recording.as_ref() else {
+            return;
+        };
+        let result = (|| -> Result<cpal::Stream, String> {
+            let mut reader = hound::WavReader::open(path).map_err(|e| format!("Recording: {e}"))?;
+            let spec = reader.spec();
+            let samples = reader
+                .samples::<i16>()
+                .map(|sample| sample.map(|s| s as f32 / 32768.0))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Recording: {e}"))?;
+            if samples.is_empty() {
+                return Err("Recording is empty".into());
             }
-
-            let play_samples = samples.lock().unwrap().clone();
-            let play_pos = Arc::new(Mutex::new(0usize));
-            let play_done = Arc::new(Mutex::new(false));
-            let done_clone = play_done.clone();
-            let rate_ratio = sample_rate as f64 / out_rate as f64;
-            let frac = Arc::new(Mutex::new(0.0f64));
-
-            let stream = speaker.build_output_stream(
+            let host = cpal::default_host();
+            let physical = |device: &cpal::Device| {
+                device
+                    .name()
+                    .map(|name| !name.to_lowercase().contains("cable input"))
+                    .unwrap_or(false)
+            };
+            let speaker = host
+                .default_output_device()
+                .filter(physical)
+                .or_else(|| host.output_devices().ok()?.find(physical))
+                .ok_or("No speakers available")?;
+            let config = speaker.default_output_config().map_err(|e| e.to_string())?;
+            let mut playback =
+                audio::Playback::new(samples, spec.sample_rate, config.sample_rate().0);
+            self.playback_finished.store(false, Ordering::Release);
+            let finished = self.playback_finished.clone();
+            let error_finished = finished.clone();
+            let errors = self.ui_errors.clone();
+            let stream = audio::build_output_stream(
+                &speaker,
                 &config,
-                move |data: &mut [f32], _| {
-                    let mut pos = play_pos.lock().unwrap();
-                    let mut f = frac.lock().unwrap();
-                    for frame in data.chunks_mut(out_channels) {
-                        if *pos < play_samples.len() {
-                            let sample = play_samples[*pos];
-                            for ch in frame.iter_mut() {
-                                *ch = sample;
-                            }
-                            *f += rate_ratio;
-                            while *f >= 1.0 {
-                                *f -= 1.0;
-                                *pos += 1;
-                            }
-                        } else {
-                            for ch in frame.iter_mut() {
-                                *ch = 0.0;
-                            }
-                            *done_clone.lock().unwrap() = true;
-                        }
+                move || match playback.next_sample() {
+                    Some(sample) => sample,
+                    None => {
+                        finished.store(true, Ordering::Release);
+                        0.0
                     }
                 },
-                |e| eprintln!("Playback error: {}", e),
-                None,
-            );
-
-            match stream {
-                Ok(stream) => {
-                    if stream.play().is_ok() {
-                        std::thread::spawn(move || {
-                            // Wait until playback finishes
-                            loop {
-                                std::thread::sleep(std::time::Duration::from_millis(50));
-                                if *play_done.lock().unwrap() {
-                                    break;
-                                }
-                            }
-                            drop(stream);
-                            *status.lock().unwrap() = "Ready".to_string();
-                        });
-                    } else {
-                        *status.lock().unwrap() = "Failed to start playback".to_string();
-                    }
-                }
-                Err(e) => {
-                    *status.lock().unwrap() = format!("Playback error: {}", e);
-                }
+                move |error| {
+                    error_finished.store(true, Ordering::Release);
+                    let _ = errors.push(format!("Playback failed: {error}"));
+                },
+            )?;
+            stream.play().map_err(|e| e.to_string())?;
+            Ok(stream)
+        })();
+        match result {
+            Ok(stream) => {
+                self.playback_stream = Some(stream);
+                *self.status.lock().unwrap() = "Playing recording…".into();
             }
+            Err(error) => *self.status.lock().unwrap() = error,
         }
     }
 
@@ -1275,6 +1667,12 @@ impl MicroboostApp {
 
 impl eframe::App for MicroboostApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_desktop(ctx);
+        if self.quitting {
+            return;
+        }
+        self.sync_audio_controls();
+        self.service_audio();
         // Poll setup thread
         self.check_setup_thread();
 
@@ -1318,30 +1716,39 @@ impl eframe::App for MicroboostApp {
             || self.cal_phase == CalibrationPhase::Listening
             || matches!(self.setup_state, SetupState::Downloading)
         {
-            ctx.request_repaint();
+            let delay = if self.hidden {
+                // Don't replay tray time as waveform history when restored.
+                self.last_visual_sample = std::time::Instant::now();
+                std::time::Duration::from_millis(250)
+            } else {
+                self.tick_visualizer(std::time::Instant::now())
+            };
+            ctx.request_repaint_after(delay);
         } else if self.setup_state == SetupState::Ready {
-            // Repaint every 2s for device hot-plug detection even when idle
-            ctx.request_repaint_after(std::time::Duration::from_secs(2));
+            self.last_visual_sample = std::time::Instant::now();
+            // Poll device recovery even when idle.
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(8.0);
-
-            match &self.setup_state {
-                SetupState::NotInstalled => {
-                    self.show_setup_screen(ui);
-                }
-                SetupState::Downloading => {
-                    self.show_progress_screen(ui);
-                }
-                SetupState::Failed(err) => {
-                    let err = err.clone();
-                    self.show_failed_screen(ui, &err);
-                }
-                SetupState::Ready => {
-                    self.show_main_screen(ui);
-                }
-            }
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| match &self.setup_state {
+                    SetupState::NotInstalled => {
+                        self.show_setup_screen(ui);
+                    }
+                    SetupState::Downloading => {
+                        self.show_progress_screen(ui);
+                    }
+                    SetupState::Failed(err) => {
+                        let err = err.clone();
+                        self.show_failed_screen(ui, &err);
+                    }
+                    SetupState::Ready => {
+                        self.show_main_screen(ui);
+                    }
+                });
         });
     }
 }
@@ -1353,7 +1760,9 @@ impl MicroboostApp {
 
         ui.label("Microboost needs VB-CABLE (free) to route boosted audio to other apps.");
         ui.add_space(8.0);
-        ui.label("VB-CABLE creates a virtual microphone that apps like Discord, Teams, etc. can use.");
+        ui.label(
+            "VB-CABLE creates a virtual microphone that apps like Discord, Teams, etc. can use.",
+        );
         ui.add_space(16.0);
 
         ui.label("What will happen:");
@@ -1376,7 +1785,10 @@ impl MicroboostApp {
         }
 
         ui.add_space(8.0);
-        if ui.link("Already have a virtual cable? Skip setup").clicked() {
+        if ui
+            .link("Already have a virtual cable? Skip setup")
+            .clicked()
+        {
             self.setup_state = SetupState::Ready;
             self.refresh_devices();
         }
@@ -1403,7 +1815,10 @@ impl MicroboostApp {
             self.start_vbcable_install();
         }
         ui.add_space(8.0);
-        if ui.link("Skip — I'll set up a virtual cable manually").clicked() {
+        if ui
+            .link("Skip — I'll set up a virtual cable manually")
+            .clicked()
+        {
             self.setup_state = SetupState::Ready;
             self.refresh_devices();
         }
@@ -1442,6 +1857,9 @@ impl MicroboostApp {
             });
 
         if prev_input != self.selected_input {
+            if self.is_recording {
+                self.stop_recording();
+            }
             // Save boost for old device, load for new one
             if let Some(old_name) = self.input_devices.get(prev_input) {
                 let gate = self.noise_gate.lock().unwrap();
@@ -1465,13 +1883,8 @@ impl MicroboostApp {
             profiles::save(&self.device_profiles);
 
             // Restart pipeline with new device
-            let was_active = self.is_active;
             self.kill_pipeline();
             self.start_pipeline();
-            if !was_active {
-                // Was in passthrough mode — go back to passthrough
-                self.stop_pipeline();
-            }
         }
 
         ui.add_space(8.0);
@@ -1530,10 +1943,7 @@ impl MicroboostApp {
         ui.horizontal(|ui| {
             for &preset in &boost_presets {
                 let label = format!("{:.1}x", preset as f32 / 100.0);
-                if ui
-                    .selectable_label(self.boost == preset, &label)
-                    .clicked()
-                {
+                if ui.selectable_label(self.boost == preset, &label).clicked() {
                     self.boost = preset;
                     if self.is_active {
                         self.update_gain();
@@ -1574,10 +1984,7 @@ impl MicroboostApp {
                     );
                     ui.add_space(2.0);
                     ui.label(
-                        egui::RichText::new(
-                            CALIBRATION_PHRASES[self.cal_phrase_idx],
-                        )
-                        .italics(),
+                        egui::RichText::new(CALIBRATION_PHRASES[self.cal_phrase_idx]).italics(),
                     );
                     ui.add_space(4.0);
 
@@ -1591,16 +1998,10 @@ impl MicroboostApp {
                     // Map -60dB..0dB to 0..1
                     let level = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
 
-                    let (rect, _) = ui.allocate_exact_size(
-                        egui::vec2(340.0, 12.0),
-                        egui::Sense::hover(),
-                    );
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(340.0, 12.0), egui::Sense::hover());
                     let painter = ui.painter();
-                    painter.rect_filled(
-                        rect,
-                        3.0,
-                        egui::Color32::from_rgb(40, 40, 40),
-                    );
+                    painter.rect_filled(rect, 3.0, egui::Color32::from_rgb(40, 40, 40));
                     let bar_color = if level > 0.85 {
                         egui::Color32::from_rgb(220, 60, 60)
                     } else if level > 0.6 {
@@ -1623,7 +2024,12 @@ impl MicroboostApp {
                     });
                 });
             }
-            CalibrationPhase::Done { boost_pct, raw_db, boosted_db, target_db } => {
+            CalibrationPhase::Done {
+                boost_pct,
+                raw_db,
+                boosted_db,
+                target_db,
+            } => {
                 let boost_val = *boost_pct;
                 let raw_db = *raw_db;
                 let boosted_db = *boosted_db;
@@ -1650,50 +2056,65 @@ impl MicroboostApp {
                     // Your voice level
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Your mic ").small());
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(bar_width, 10.0), egui::Sense::hover(),
-                        );
+                        let (rect, _) = ui
+                            .allocate_exact_size(egui::vec2(bar_width, 10.0), egui::Sense::hover());
                         let p = ui.painter();
                         p.rect_filled(rect, 2.0, egui::Color32::from_rgb(40, 40, 40));
                         p.rect_filled(
-                            egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * raw_frac, 10.0)),
-                            2.0, egui::Color32::from_rgb(80, 130, 200),
+                            egui::Rect::from_min_size(
+                                rect.min,
+                                egui::vec2(rect.width() * raw_frac, 10.0),
+                            ),
+                            2.0,
+                            egui::Color32::from_rgb(80, 130, 200),
                         );
                         // Target marker line
                         let tx = rect.min.x + rect.width() * target_frac;
                         p.line_segment(
                             [egui::pos2(tx, rect.min.y), egui::pos2(tx, rect.max.y)],
-                            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 200, 60)),
+                            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 200, 60)),
                         );
                     });
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("           {:.1} dBFS", raw_db)).small()
-                            .color(egui::Color32::from_rgb(80, 130, 200)));
+                        ui.label(
+                            egui::RichText::new(format!("           {:.1} dBFS", raw_db))
+                                .small()
+                                .color(egui::Color32::from_rgb(80, 130, 200)),
+                        );
                     });
 
                     // Boosted level
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Boosted  ").small());
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(bar_width, 10.0), egui::Sense::hover(),
-                        );
+                        let (rect, _) = ui
+                            .allocate_exact_size(egui::vec2(bar_width, 10.0), egui::Sense::hover());
                         let p = ui.painter();
                         p.rect_filled(rect, 2.0, egui::Color32::from_rgb(40, 40, 40));
                         p.rect_filled(
-                            egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * boosted_frac, 10.0)),
-                            2.0, egui::Color32::from_rgb(60, 200, 60),
+                            egui::Rect::from_min_size(
+                                rect.min,
+                                egui::vec2(rect.width() * boosted_frac, 10.0),
+                            ),
+                            2.0,
+                            egui::Color32::from_rgb(60, 200, 60),
                         );
                         let tx = rect.min.x + rect.width() * target_frac;
                         p.line_segment(
                             [egui::pos2(tx, rect.min.y), egui::pos2(tx, rect.max.y)],
-                            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 200, 60)),
+                            egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 200, 60)),
                         );
                     });
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("           {:.1} dBFS", boosted_db)).small()
-                            .color(egui::Color32::from_rgb(60, 200, 60)));
-                        ui.label(egui::RichText::new(format!("  | target: {:.1} dBFS", target_db)).small()
-                            .color(egui::Color32::from_rgb(255, 200, 60)));
+                        ui.label(
+                            egui::RichText::new(format!("           {:.1} dBFS", boosted_db))
+                                .small()
+                                .color(egui::Color32::from_rgb(60, 200, 60)),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("  | target: {:.1} dBFS", target_db))
+                                .small()
+                                .color(egui::Color32::from_rgb(255, 200, 60)),
+                        );
                     });
 
                     if boost_val >= 500 {
@@ -1709,11 +2130,7 @@ impl MicroboostApp {
                     ui.horizontal(|ui| {
                         if ui.button("Accept").clicked() {
                             self.boost = boost_val;
-                            if *self.pipeline_active.lock().unwrap() {
-                                self.update_gain();
-                            } else {
-                                self.start_pipeline();
-                            }
+                            self.set_mode(AudioMode::Boost);
                             self.save_current_profile();
                             self.cal_phase = CalibrationPhase::Idle;
                         }
@@ -1732,7 +2149,8 @@ impl MicroboostApp {
 
         // Noise gate
         if self.ng_calibrating {
-            let elapsed = self.ng_cal_start
+            let elapsed = self
+                .ng_cal_start
                 .map(|s| s.elapsed().as_secs_f32())
                 .unwrap_or(0.0);
             let remaining = (3.0 - elapsed).max(0.0);
@@ -1749,6 +2167,7 @@ impl MicroboostApp {
             });
         } else {
             let mut ng_changed = false;
+            let mut calibrate_requested = false;
             ui.horizontal(|ui| {
                 let mut gate = self.noise_gate.lock().unwrap();
                 let is_calibrated = gate.is_calibrated();
@@ -1756,7 +2175,11 @@ impl MicroboostApp {
 
                 let prev_enabled = gate.enabled;
                 let mut enabled = gate.enabled;
-                ui.checkbox(&mut enabled, "Noise Gate");
+                if ui.checkbox(&mut enabled, "Noise Gate")
+                    .on_hover_text("Enable background-noise suppression. First use starts a three-second silent calibration. Applies in Boost mode.")
+                    .changed() && enabled && !is_calibrated {
+                    calibrate_requested = true;
+                }
                 gate.enabled = enabled && is_calibrated;
                 if gate.enabled != prev_enabled {
                     ng_changed = true;
@@ -1786,37 +2209,64 @@ impl MicroboostApp {
             });
             if ng_changed {
                 self.save_current_profile();
+                self.sync_audio_controls();
+            }
+            if calibrate_requested {
+                self.start_noise_calibration();
             }
         }
 
         ui.add_space(4.0);
 
-        // Start/Stop
-        let btn_text = if self.is_active {
-            "Stop Boost"
-        } else {
-            "Start Boost"
-        };
-        let btn_color = if self.is_active {
-            egui::Color32::from_rgb(200, 60, 60)
-        } else {
-            egui::Color32::from_rgb(60, 160, 60)
-        };
-        let btn = ui.add_sized(
-            [340.0, 36.0],
-            egui::Button::new(
-                egui::RichText::new(btn_text)
-                    .color(egui::Color32::WHITE)
-                    .strong(),
-            )
-            .fill(btn_color),
-        );
-        if btn.clicked() {
-            if self.is_active {
-                self.stop_pipeline();
-            } else {
-                self.start_pipeline();
+        ui.horizontal(|ui| {
+            for mode in [AudioMode::Boost, AudioMode::Bypass, AudioMode::Mute] {
+                if ui
+                    .selectable_label(self.mode == mode, mode.label())
+                    .clicked()
+                {
+                    self.set_mode(mode);
+                    self.save_current_profile();
+                }
             }
+        });
+        ui.label(
+            egui::RichText::new(match self.mode {
+                AudioMode::Boost if self.settings.peak_protection => {
+                    "Noise gate → boost → peak protection"
+                }
+                AudioMode::Boost => "Noise gate → boost (peak protection off)",
+                AudioMode::Bypass => "Original microphone level, without processing",
+                AudioMode::Mute => "Silence sent to your virtual microphone",
+            })
+            .small(),
+        );
+        if ui.checkbox(&mut self.settings.peak_protection, "Boost protection (peak limiter)")
+            .on_hover_text("Prevents boosted peaks from clipping. Recommended on. Applies in Boost mode; turning it off can distort loud audio.")
+            .changed() {
+            profiles::save_settings(&self.settings);
+            self.sync_audio_controls();
+        }
+        if !self.settings.peak_protection && self.mode == AudioMode::Boost {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "Protection off — loud audio may distort",
+            );
+        }
+        let reduction = self.controls.reduction_db.get();
+        if self.settings.peak_protection && reduction > 0.1 && self.mode == AudioMode::Boost {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                format!("Peak protection: {:.1} dB reduction", reduction),
+            );
+        }
+        if self.controls.clipped.load(Ordering::Relaxed) > 0 {
+            ui.colored_label(
+                egui::Color32::LIGHT_RED,
+                "Microphone clipping detected — lower its input level",
+            );
+        }
+        if !*self.pipeline_active.lock().unwrap() && ui.button("Reconnect audio now").clicked() {
+            self.start_pipeline();
         }
 
         if self.is_active {
@@ -1828,36 +2278,17 @@ impl MicroboostApp {
                 .unwrap_or("CABLE Output".to_string());
             ui.colored_label(
                 egui::Color32::from_rgb(100, 200, 100),
-                format!("In Discord/Teams/etc, select \"{}\" as your mic", cable_name),
+                format!(
+                    "In Discord/Teams/etc, select \"{}\" as your mic",
+                    cable_name
+                ),
             );
         }
 
         // Live audio waveform visualizer — both waves overlaid
         if *self.pipeline_active.lock().unwrap() {
             ui.add_space(4.0);
-            let in_rms = *self.live_input_rms.lock().unwrap();
-            let out_rms = *self.live_output_rms.lock().unwrap();
-
-            // Push to rolling history every 4 frames (4x slower scroll)
-            self.vis_accum_in += in_rms;
-            self.vis_accum_out += out_rms;
-            self.vis_frame += 1;
-            if self.vis_frame >= 4 {
-                self.input_history.push(self.vis_accum_in / 4.0);
-                self.output_history.push(self.vis_accum_out / 4.0);
-                self.vis_frame = 0;
-                self.vis_accum_in = 0.0;
-                self.vis_accum_out = 0.0;
-            }
-            let max_points = 150;
-            if self.input_history.len() > max_points {
-                self.input_history.drain(0..self.input_history.len() - max_points);
-            }
-            if self.output_history.len() > max_points {
-                self.output_history.drain(0..self.output_history.len() - max_points);
-            }
-
-            let wave_w = 370.0;
+            let wave_w = 370.0_f32.min(ui.available_width());
             let wave_h = 60.0;
             let in_color = egui::Color32::from_rgb(60, 140, 220);
             let out_color = egui::Color32::from_rgb(80, 220, 80);
@@ -1867,18 +2298,25 @@ impl MicroboostApp {
                 ui.label(egui::RichText::new("---").small().color(in_color));
                 ui.label(egui::RichText::new("Input").small());
                 ui.label(egui::RichText::new("---").small().color(out_color));
-                ui.label(egui::RichText::new("Output (boosted)").small());
+                ui.label(
+                    egui::RichText::new(match self.mode {
+                        AudioMode::Boost => "Output (boosted)",
+                        AudioMode::Bypass => "Output (original)",
+                        AudioMode::Mute => "Output (muted)",
+                    })
+                    .small(),
+                );
             });
 
-            let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(wave_w, wave_h),
-                egui::Sense::hover(),
-            );
-            let p = ui.painter();
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(wave_w, wave_h), egui::Sense::hover());
+            // Keep every visualizer shape inside the graph. This is especially
+            // important when input and output overlap in 1x passthrough mode.
+            let p = ui.painter_at(rect);
             p.rect_filled(rect, 3.0, egui::Color32::from_rgb(20, 20, 25));
 
             let rms_to_frac = |rms: f32| -> f32 {
-                if rms > 0.0001 {
+                if rms.is_finite() && rms > 0.0001 {
                     ((20.0 * rms.log10() + 60.0) / 60.0).clamp(0.0, 1.0)
                 } else {
                     0.0
@@ -1906,7 +2344,7 @@ impl MicroboostApp {
             let in_pts = make_points(&self.input_history);
             let out_pts = make_points(&self.output_history);
 
-            if in_pts.len() >= 2 && out_pts.len() >= 2 {
+            if self.is_active && in_pts.len() >= 2 && out_pts.len() >= 2 {
                 // Fill between the two curves to show boost amount
                 let n = in_pts.len().min(out_pts.len());
                 let fill_color = egui::Color32::from_rgba_premultiplied(40, 180, 40, 25);
@@ -1919,28 +2357,35 @@ impl MicroboostApp {
                         // Curves cross in this segment — skip fill to avoid artifacts
                         continue;
                     }
-                    let quad = vec![
-                        in_pts[i],
-                        in_pts[i + 1],
-                        out_pts[i + 1],
-                        out_pts[i],
-                    ];
+                    // Equal or near-equal curves create a zero-area polygon. Some
+                    // graphics backends can tessellate those into screen-spanning
+                    // triangles, which is most visible when boost is turned off.
+                    let left_gap = (in_pts[i].y - out_pts[i].y).abs();
+                    let right_gap = (in_pts[i + 1].y - out_pts[i + 1].y).abs();
+                    if left_gap.max(right_gap) < 0.5 {
+                        continue;
+                    }
+                    let quad = vec![in_pts[i], in_pts[i + 1], out_pts[i + 1], out_pts[i]];
                     p.add(egui::Shape::convex_polygon(
                         quad,
                         fill_color,
                         egui::Stroke::NONE,
                     ));
                 }
+            }
 
-                // Draw input line (thinner, behind)
+            // Draw both traces even in passthrough mode, but outside the filled-area
+            // condition so stopping boost still leaves a useful level display.
+            if in_pts.len() >= 2 {
                 p.add(egui::Shape::line(
                     in_pts,
-                    egui::Stroke::new(1.5, in_color),
+                    egui::Stroke::new(1.5_f32, in_color),
                 ));
-                // Draw output line (thicker, on top)
+            }
+            if out_pts.len() >= 2 {
                 p.add(egui::Shape::line(
                     out_pts,
-                    egui::Stroke::new(2.0, out_color),
+                    egui::Stroke::new(2.0_f32, out_color),
                 ));
             }
 
@@ -1950,7 +2395,7 @@ impl MicroboostApp {
                 let y = rect.max.y - frac * rect.height();
                 p.line_segment(
                     [egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)],
-                    egui::Stroke::new(0.5, egui::Color32::from_rgb(50, 50, 55)),
+                    egui::Stroke::new(0.5_f32, egui::Color32::from_rgb(50, 50, 55)),
                 );
                 p.text(
                     egui::pos2(rect.max.x - 22.0, y - 6.0),
@@ -1974,9 +2419,11 @@ impl MicroboostApp {
 
             if self.device_profiles.is_empty() {
                 ui.label(
-                    egui::RichText::new("No saved profiles yet. Calibrate or start boost to save one.")
-                        .small()
-                        .color(egui::Color32::GRAY),
+                    egui::RichText::new(
+                        "No saved profiles yet. Calibrate or start boost to save one.",
+                    )
+                    .small()
+                    .color(egui::Color32::GRAY),
                 );
             } else {
                 let mut names: Vec<String> = self.device_profiles.keys().cloned().collect();
@@ -1986,16 +2433,13 @@ impl MicroboostApp {
                     let is_current = current_device.as_deref() == Some(name.as_str());
                     ui.horizontal(|ui| {
                         // Shorten long device names
-                        let short_name = if name.len() > 30 {
-                            format!("{}...", &name[..27])
+                        let short_name = if name.chars().count() > 30 {
+                            format!("{}...", name.chars().take(27).collect::<String>())
                         } else {
                             name.clone()
                         };
-                        let label = format!(
-                            "{} — {:.1}x",
-                            short_name,
-                            profile.boost as f32 / 100.0
-                        );
+                        let label =
+                            format!("{} — {:.1}x", short_name, profile.boost as f32 / 100.0);
                         if is_current {
                             ui.label(
                                 egui::RichText::new(&label)
@@ -2010,7 +2454,11 @@ impl MicroboostApp {
                         {
                             to_load = Some((name.clone(), profile.boost));
                         }
-                        if ui.small_button("x").on_hover_text("Delete profile").clicked() {
+                        if ui
+                            .small_button("x")
+                            .on_hover_text("Delete profile")
+                            .clicked()
+                        {
                             to_delete = Some(name.clone());
                         }
                     });
@@ -2031,7 +2479,11 @@ impl MicroboostApp {
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.small_button("Save current").on_hover_text("Save boost for current mic").clicked() {
+                if ui
+                    .small_button("Save current")
+                    .on_hover_text("Save boost for current mic")
+                    .clicked()
+                {
                     self.save_current_profile();
                 }
             });
@@ -2060,7 +2512,10 @@ impl MicroboostApp {
             }
 
             if ui
-                .add_enabled(self.last_recording.is_some(), egui::Button::new("Play"))
+                .add_enabled(
+                    self.last_recording.is_some() && !self.is_recording,
+                    egui::Button::new("Play"),
+                )
                 .clicked()
             {
                 self.play_recording();
@@ -2071,7 +2526,9 @@ impl MicroboostApp {
             }
 
             if ui.button("Refresh Devices").clicked() {
-                self.refresh_devices();
+                self.last_device_check =
+                    std::time::Instant::now() - std::time::Duration::from_secs(2);
+                self.check_device_changes();
             }
         });
 
@@ -2079,11 +2536,75 @@ impl MicroboostApp {
         let status = self.status.lock().unwrap().clone();
         ui.label(&status);
 
+        ui.collapsing("Preferences", |ui| {
+            let mut startup = self.start_with_windows;
+            if ui.checkbox(&mut startup, "Start with Windows").changed() {
+                match desktop::set_start_with_windows(startup) {
+                    Ok(()) => self.start_with_windows = startup,
+                    Err(error) => {
+                        *self.status.lock().unwrap() = format!("Startup setting failed: {error}")
+                    }
+                }
+            }
+            if ui
+                .checkbox(&mut self.settings.close_to_tray, "Close window to tray")
+                .changed()
+            {
+                profiles::save_settings(&self.settings);
+            }
+            ui.label(format!(
+                "Remembered startup mode: {}",
+                self.settings.startup_mode.label()
+            ));
+            ui.label("Minimizing keeps audio running in the tray.");
+            if ui
+                .add_enabled(self.tray.is_some(), egui::Button::new("Hide to tray"))
+                .clicked()
+            {
+                self.hidden = true;
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+            if ui.button("Quit Microboost").clicked() {
+                if self.is_recording {
+                    self.stop_recording();
+                }
+                self.save_current_profile();
+                self.kill_pipeline();
+                self.quitting = true;
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        });
+        ui.collapsing("Audio diagnostics", |ui| {
+            ui.label(format!(
+                "Dropped input samples: {}",
+                self.controls.dropped.load(Ordering::Relaxed)
+            ));
+            ui.label(format!(
+                "Playback underruns: {}",
+                self.controls.underruns.load(Ordering::Relaxed)
+            ));
+            ui.label(format!(
+                "Recording samples missed: {}",
+                self.controls.recording_dropped.load(Ordering::Relaxed)
+            ));
+            if ui.button("Reset meters").clicked() {
+                self.controls.clipped.store(0, Ordering::Relaxed);
+                self.controls.dropped.store(0, Ordering::Relaxed);
+                self.controls.underruns.store(0, Ordering::Relaxed);
+                self.controls.recording_dropped.store(0, Ordering::Relaxed);
+            }
+        });
+
         ui.add_space(4.0);
         ui.label(
-            egui::RichText::new(format!("v{} ({})", env!("CARGO_PKG_VERSION"), env!("BUILD_TIMESTAMP")))
-                .small()
-                .color(egui::Color32::from_rgb(90, 90, 100)),
+            egui::RichText::new(format!(
+                "v{} ({})",
+                env!("CARGO_PKG_VERSION"),
+                env!("BUILD_TIMESTAMP")
+            ))
+            .small()
+            .color(egui::Color32::from_rgb(90, 90, 100)),
         );
     }
 }

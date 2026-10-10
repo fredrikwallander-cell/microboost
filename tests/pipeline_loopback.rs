@@ -1,8 +1,10 @@
 /// Send voice through the actual microboost pipeline (ring buffer + gain + gate)
 /// into VB-CABLE, record back, and compare with the original.
-
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use microboost::{noise_gate, SpscRing, RING_SIZE};
+use microboost::{
+    processing::{AudioMode, AudioProcessor, ProcessingSettings},
+    Resampler, SpscRing, RING_SIZE,
+};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -38,11 +40,18 @@ fn load_wav(path: &str) -> (Vec<f32>, u32) {
 fn voice_through_pipeline_and_cable() {
     let fixture = "tests/fixtures/test_voice.wav";
     if !std::path::Path::new(fixture).exists() {
-        eprintln!("Skipping: {} not found (run audio_test/e2e_test first)", fixture);
+        eprintln!(
+            "Skipping: {} not found (run audio_test/e2e_test first)",
+            fixture
+        );
         return;
     }
     let host = cpal::default_host();
-    let has_cable = host.output_devices().unwrap().any(|d| d.name().map(|n| n.to_lowercase().contains("cable")).unwrap_or(false));
+    let has_cable = host.output_devices().unwrap().any(|d| {
+        d.name()
+            .map(|n| n.to_lowercase().contains("cable"))
+            .unwrap_or(false)
+    });
     if !has_cable {
         eprintln!("Skipping: VB-CABLE not installed");
         return;
@@ -56,10 +65,10 @@ fn voice_through_pipeline_and_cable() {
         voice.len() as f64 / voice_rate as f64
     );
 
-    let cable_out = find_device(&host, "CABLE Input", false)
-        .expect("CABLE Input (playback) not found");
-    let cable_in = find_device(&host, "CABLE Output", true)
-        .expect("CABLE Output (recording) not found");
+    let cable_out =
+        find_device(&host, "CABLE Input", false).expect("CABLE Input (playback) not found");
+    let cable_in =
+        find_device(&host, "CABLE Output", true).expect("CABLE Output (recording) not found");
 
     let out_config = cable_out.default_output_config().unwrap();
     let in_config = cable_in.default_input_config().unwrap();
@@ -69,18 +78,18 @@ fn voice_through_pipeline_and_cable() {
 
     eprintln!(
         "CABLE out: {}Hz {}ch, CABLE in: {}Hz {}ch",
-        out_rate, out_channels, in_config.sample_rate().0, in_channels
+        out_rate,
+        out_channels,
+        in_config.sample_rate().0,
+        in_channels
     );
 
     // === Set up the microboost pipeline ===
     let ring = Arc::new(SpscRing::new(RING_SIZE));
-    let gate = Arc::new(Mutex::new(noise_gate::NoiseGate::new())); // disabled
     let gain = 1.0f32; // 1x boost
 
     // Simulate input callback: process voice samples and push to ring
     let ring_w = ring.clone();
-    let gate_w = gate.clone();
-    let write_pos = Arc::new(Mutex::new(0usize));
     let signal = voice.clone();
 
     // Record from CABLE Output
@@ -107,15 +116,20 @@ fn voice_through_pipeline_and_cable() {
 
     // Simulated "input stream" — reads from our WAV and pushes through pipeline
     let feeder = std::thread::spawn(move || {
+        let mut processor = AudioProcessor::new(voice_rate, gain);
+        let settings = ProcessingSettings {
+            mode: AudioMode::Boost,
+            gain,
+            noise_floor: 0.0,
+            gate_enabled: false,
+            peak_protection: true,
+        };
         let chunk_size = 480; // 10ms at 48kHz
         for chunk in signal.chunks(chunk_size) {
-            let mut g = gate_w.lock().unwrap();
             for &sample in chunk {
-                let boosted = (sample * gain).clamp(-1.0, 1.0);
-                let gated = g.process(boosted);
+                let gated = processor.process(sample, settings);
                 ring_w.push(gated);
             }
-            drop(g);
             // Simulate real-time pacing
             std::thread::sleep(std::time::Duration::from_micros(
                 (chunk.len() as u64 * 1_000_000) / voice_rate as u64,
@@ -125,10 +139,8 @@ fn voice_through_pipeline_and_cable() {
 
     // Output stream — reads from ring buffer and writes to CABLE
     let ring_r = ring.clone();
-    let mut last_sample: f32 = 0.0;
-    let mut frac: f64 = 0.0;
-    let rate_ratio = voice_rate as f64 / out_rate as f64;
-    let prebuf_samples = out_rate as usize / 50; // 20ms
+    let mut resampler = Resampler::new(voice_rate, out_rate);
+    let prebuf_samples = voice_rate as usize / 50; // 20ms
     let mut prebuffered = false;
     let underruns = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let underruns2 = underruns.clone();
@@ -147,24 +159,10 @@ fn voice_through_pipeline_and_cable() {
                 }
 
                 for frame in data.chunks_mut(out_channels) {
-                    let sample = if ring_r.available() > 1 {
-                        let s0 = ring_r.peek(0);
-                        let s1 = ring_r.peek(1);
-                        let t = frac as f32;
-                        let interpolated = s0 + (s1 - s0) * t;
-                        frac += rate_ratio;
-                        while frac >= 1.0 {
-                            frac -= 1.0;
-                            if ring_r.available() > 0 {
-                                ring_r.advance(1);
-                            }
-                        }
-                        last_sample = interpolated;
-                        interpolated
-                    } else {
+                    let sample = resampler.next_sample(&ring_r).unwrap_or_else(|| {
                         underruns2.fetch_add(1, Ordering::Relaxed);
-                        last_sample
-                    };
+                        0.0
+                    });
                     for ch in frame.iter_mut() {
                         *ch = sample;
                     }

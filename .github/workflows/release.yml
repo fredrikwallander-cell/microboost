@@ -4,6 +4,9 @@ on:
   push:
     tags:
       - "v*"
+    branches:
+      - "release/v*"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,14 +24,14 @@ jobs:
             target: x86_64-pc-windows-msvc
             binary: microboost.exe
             asset_name: microboost-windows-amd64.exe
-            skip_verify: false
+            run_tests: true
 
           - name: windows-arm64
             os: windows-latest
             target: aarch64-pc-windows-msvc
             binary: microboost.exe
             asset_name: microboost-windows-arm64.exe
-            skip_verify: true
+            run_tests: false
 
     steps:
       - uses: actions/checkout@v4
@@ -43,25 +46,31 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Run hardware-independent regression tests
+        if: ${{ matrix.run_tests }}
+        run: cargo test --locked --target ${{ matrix.target }} --lib --bin microboost --test passthrough_test
 
-      - name: Verify binary runs
-        if: ${{ !matrix.skip_verify }}
-        shell: bash
-        run: |
-          ./target/${{ matrix.target }}/release/${{ matrix.binary }} --help || true
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin microboost
 
       - name: Rename binary
         shell: bash
         run: |
           cp ./target/${{ matrix.target }}/release/${{ matrix.binary }} ./${{ matrix.asset_name }}
 
+      - name: Generate SHA256 checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 '${{ matrix.asset_name }}').Hash.ToLower()
+          "$hash  ${{ matrix.asset_name }}" | Set-Content -Encoding utf8 '${{ matrix.asset_name }}.sha256'
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
-          path: ./${{ matrix.asset_name }}
+          path: |
+            ./${{ matrix.asset_name }}
+            ./${{ matrix.asset_name }}.sha256
 
   release:
     name: Create Release
@@ -77,13 +86,44 @@ jobs:
         with:
           path: artifacts
 
-      - name: List artifacts
-        run: find artifacts -type f
+      - name: Read release version
+        id: version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          tag="v$version"
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "$tag" ]]; then
+            echo "Tag does not match Cargo.toml version" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_NAME" == release/* && "$GITHUB_REF_NAME" != "release/$tag" ]]; then
+            echo "Release branch does not match Cargo.toml version" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Microboost ${{ steps.version.outputs.tag }}
+          body: |
+            Windows microphone booster fork with graphical, audio-pipeline, recording, and control fixes.
+
+            - Fix stray waveform lines and mouse-dependent scroll speed; the graph shows about five seconds of audio at a fixed cadence.
+            - Fix uncalibrated Noise Gate clicks; first use starts silent calibration.
+            - Add a saved Boost protection toggle, peak limiter, reduction meter, and microphone-clipping warning.
+            - Fix unsafe audio buffering, resampling, stream startup state, device replacement, Unicode names, recording rate, and empty/stale recording state.
+            - Add Boost/Bypass/Mute modes, reconnection retries, integer audio formats, tray controls, opt-in Windows startup, and a resizable window.
+
+            See the README's Fork changes and bug fixes section for details, upstream attribution, and limitations.
+
+            Download windows-amd64 for typical Intel/AMD Windows PCs, or windows-arm64 for Windows on ARM. SHA256 checksum files are included. Executables are unsigned; Windows may show a reputation warning. VB-CABLE is required.
+
+            The x64 build runs the hardware-independent regression suite before publication. Real microphone/VB-CABLE behavior, tray/startup actions, and sleep/resume still require manual verification; ARM64 is cross-built, not runtime-tested.
           files: |
             artifacts/microboost-windows-amd64.exe/microboost-windows-amd64.exe
+            artifacts/microboost-windows-amd64.exe/microboost-windows-amd64.exe.sha256
             artifacts/microboost-windows-arm64.exe/microboost-windows-arm64.exe
+            artifacts/microboost-windows-arm64.exe/microboost-windows-arm64.exe.sha256
